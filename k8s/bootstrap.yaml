@@ -1,0 +1,335 @@
+---
+- name: 1. SETTING UP K8S CLUSTER MEMBERS...
+  gather_facts: True
+  become: True
+  hosts: k8s
+  tags: prepare
+  pre_tasks:
+    - name: Disabling ufw...
+      ufw:
+        state: disabled
+    - name: Adding K8S repo gpg key to apt...
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+    - name: Adding K8S repository...
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+    - name: Installing vim, git, wget, curl, apt-transport-https, kubelet, kubeadm, kubectl, gnupg2, software-properties-common, ca-certificates...
+      tags: packages
+      apt:
+        name:
+          - vim
+          - git
+          - wget
+          - curl
+          - apt-transport-https
+          - kubelet=1.26.1-00
+          - kubeadm=1.26.1-00
+          - kubectl=1.26.1-00
+          - gnupg2
+          - software-properties-common
+          - ca-certificates
+          - python3-pip
+          - net-tools
+          - traceroute
+          - nmap
+          - telnet
+          - ceph-common
+          - ceph-fuse
+        update_cache: True
+        state: latest
+      ignore_errors: True
+    - name: Putting kubelet package on hold to prevent updates...
+      dpkg_selections:
+        name: kubelet
+        selection: hold
+    - name: Putting kubeadm package on hold to prevent updates...
+      dpkg_selections:
+        name: kubeadm
+        selection: hold   
+    - name: Putting kubectl package on hold to prevent updates...
+      dpkg_selections:
+        name: kubectl
+        selection: hold
+    - name: Disabling cloud-init...
+      file:
+        path: /etc/cloud/cloud-init.disabled
+        state: touch
+        owner: root
+  tasks:
+    - name: Removing swap from /etc/fstab... (1/2)
+      mount:
+        name: "swap"
+        fstype: swap
+        state: absent
+      register: result2
+    - name: Removing swap from /etc/fstab... (2/2) 
+      replace:
+        path: /etc/fstab
+        regexp: '^/swap.img'
+        replace: '#/swap.img'
+        backup: True
+    - name: Disabling swap space...
+      shell: swapoff -a 
+      when: result2.changed
+    - name: Ensuring 'overlay' module is loadad...
+      tags: kernel, cri
+      modprobe:
+        name: overlay
+        state: present
+      register: result0
+    - name: Ensuring 'br_netfilter' module is loaded...
+      tags: kernel, cri
+      modprobe:
+        name: br_netfilter
+        state: present
+      register: result1
+    - name: Ensuring 'rdb' module is loaded...
+      tags: kernel, cri
+      modprobe:
+        name: rbd
+        state: present
+      register: resultrdb
+    - name: Ensuring 'ceph' module is loaded...
+      tags: kernel, cri
+      modprobe:
+        name: rbd
+        state: present
+      register: resultcephfs
+    - name: Checking kubernetes.conf in /etc/sysctl.d/...
+      tags: cri
+      blockinfile:
+        path: /etc/sysctl.d/kubernetes.conf
+        insertafter: EOF
+        block: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        state: present
+        create: True
+      register: result3
+    - name: Checking containerd.conf in /etc/modules-load/...
+      tags: cri
+      blockinfile:
+        path: /etc/modules-load/containerd.conf
+        insertafter: EOF 
+        block: |
+          overlay
+          br_netfilter
+          rbd
+        state: present
+        create: True
+      register: result4
+    - name: Running 'sysctl --system' if needed
+      tags: cri
+      shell: sysctl --system
+      when: result0.changed or result1.changed or result3.changed or result4.changed or resultrdb.changed or resultcephfs.changed
+    - name: Adding Docker repo gpg key to apt...
+      tags: packages
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+    - name: Adding Docker repository...
+      tags: packages
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+    - name: Installing containerd...
+      tags: cri, packages
+      apt:
+        name:
+          - containerd.io 
+        update_cache: True 
+        state: latest
+    - name: Checking if /etc/containerd/ exists...
+      tags: cri
+      file:
+        path: /etc/containerd/
+        state: directory
+    - name: Overwriting containerd config...
+      tags: cri
+      copy:
+        src: ./tools/registry/config.toml
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        force: True
+    - name: Enabling cri...
+      tags: cri
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'disabled_plugins'
+        replace: '#disabled_plugins'
+        backup: True
+
+- name: 2. RESTARTING SERVICES ON ALL CLUSTER NODES...
+  gather_facts: False
+  become: True
+  hosts: k8s
+  tags: prepare
+  tasks:
+    - name: Stopping kubelet service...
+      tags: services
+      systemd:
+        name: kubelet
+        state: stopped
+    - name: Stopping containerd service...
+      tags: services
+      systemd:
+        name: containerd
+        state: stopped
+    - name: Enabling containerd service...
+      tags: services
+      systemd:
+        name: containerd
+        enabled: True
+        state: started
+    - name: Enabling kubelet service...
+      tags: services
+      systemd:
+        name: kubelet
+        enabled: True
+        state: started
+
+- name: 3. BOOTSTRAPPING PRIMARY CONTROL PLANE...
+  tags: bootstrap
+  gather_facts: True 
+  become: True 
+  hosts: controlplane 
+  vars_files:
+    - vars.yaml
+  tasks:
+    - name: Checking if cluster has been initialized...
+      stat:
+        path: '/etc/kubernetes/pki/ca.key'
+      register: ca 
+    - name: Initializing control-plane if needed...
+      shell: kubeadm init --pod-network-cidr={{ networkcidr  }} --service-cidr={{ servicecidr }} --upload-certs --control-plane-endpoint={{ controlplane }}
+      when: not ca.stat.exists
+      register: kubeadm_output
+    - name: Saving bootstrap output on local computer...
+      copy:
+        content: "{{ kubeadm_output.stdout }}"
+        dest: kubeadm_cp_log.txt
+      when: kubeadm_output.changed 
+      delegate_to: localhost
+    - name: Checking if ~/.kube/ exists...
+      file:
+        path: $HOME/.kube
+        state: directory
+    - name: Copying K8S configuration to ~/.kube/config...
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: $HOME/.kube/config
+        remote_src: True
+        owner: root
+        group: root
+        force: True
+
+- name: 4. INSTALLING CALICO NETWORK MANAGER...
+  tags: network
+  gather_facts: True
+  become: True
+  hosts: controlplane
+  vars_files:
+    - vars.yaml
+  pre_tasks:
+    - name: Checking for existing Calico manifests...
+      stat:
+        path: '~/custom-resources.yaml'
+      register: calicostat
+    - name: Copying local Calico manifests to control plane node if needed...
+      copy: src={{ item.src }} dest={{ item.dest }}
+      with_items:
+        - { src: './calico/01_tigera-operator.yaml', dest: '~/' }
+        - { src: './calico/02_custom-resources.yaml', dest: '~/' }
+      when: not calicostat.stat.exists
+      register: calicocopy
+    - name: Setting Pod Network in custom-resources.yaml if needed (1/2)...
+      replace:
+        path: ~/02_custom-resources.yaml
+        regexp: 'podugualenetwork'
+        replace: '{{ networkcidr }}'
+      when: calicocopy.changed
+    - name: Setting Pod Network in custom-resources.yaml if needed (2/2)...
+      replace:
+        path: ~/02_custom-resources.yaml
+        regexp: 'blocchicalico'
+        replace: '{{ netblocksize }}'
+      when: calicocopy.changed
+    - name: Checking for existing lock files...
+      tags: calico
+      stat:
+        path: /root/.calico.lock
+      register: calicolock
+  tasks:
+    - name: Calico (1/2) -  Deploying Tigera Operator...
+      tags: calico
+      shell: kubectl create -f ~/01_tigera-operator.yaml
+      when: not calicolock.stat.exists
+      register: calicoinstalled1
+    - name: Calico (2/2) -  Configuring resources...
+      tags: calico
+      shell: kubectl create -f ~/02_custom-resources.yaml
+      when: not calicolock.stat.exists
+      register: calicoinstalled2
+  post_tasks:
+    - name: Creating lock files for initialized control plane nodes...
+      tags: calico, lock
+      file:
+        path: /root/.calico.lock
+        state: touch
+        owner: root
+      when: calicoinstalled1.changed and calicoinstalled2.changed
+    - name: Getting the token to join worker nodes...
+      tags: workers
+      shell: kubeadm token create --print-join-command
+      register: joinstring1 
+    - set_fact: 
+        joinstring: "{{ joinstring1.stdout }}"
+      tags: workers
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      with_items: "{{ groups['worker'] }}"
+
+- name: 6. JOINING WORKER NODES...
+  tags: workers
+  gather_facts: True
+  become: True
+  hosts: worker
+  vars_files:
+    - vars.yaml
+  pre_tasks:
+    - name: Checking for existing lock files...
+      # ensures that a node can only be joined once
+      stat: 
+        path: /root/.joined.lock
+      register: workerlock
+  tasks:
+    - name: Joining worker nodes to the cluster...
+      shell: "{{ joinstring }}"
+      when: not workerlock.stat.exists
+      register: joined
+  post_tasks:
+    - name: Creating lock files for joined worker nodes...
+      # lock file must be deleted manually if you want to rejoin a node to the cluster after removal
+      tags: lock
+      file:
+        path: /root/.joined.lock
+        state: touch
+        owner: root
+      when: joined.changed
+
+- name: 7. LABELING WORKER NODES
+  tags: workers
+  gather_facts: False
+  become: False
+  hosts: "{{ controlplane }}"
+  vars_files:
+    - vars.yaml
+  tasks:
+    - name: Setting worker=True label for each worker node...
+      shell: kubectl label node {{ item }} worker=True
+      with_items: "{{ groups['workers'] }}"

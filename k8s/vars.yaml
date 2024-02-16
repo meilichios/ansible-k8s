@@ -1,0 +1,5 @@
+---
+networkcidr: 172.16.254.0/24 # calico overlay network
+servicecidr: 172.16.253.0/24 # calico overlay network
+controlplane: localhost # primary control plane
+netblocksize: 24

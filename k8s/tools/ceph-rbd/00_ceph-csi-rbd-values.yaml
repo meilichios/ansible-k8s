@@ -1,0 +1,8 @@
+csiConfig:
+  - clusterID: "6618c032-1f9e-11ed-ae09-770f0204e425"
+    monitors:
+      - "192.168.1.1:6789" # todo: isolate
+  
+provisioner:
+  name: provisioner
+  replicaCount: 2
